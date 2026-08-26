@@ -5,7 +5,11 @@ either the CI agent or CD agent based on their needs.
 """
 from agent_core import Tool
 import json
+import os
 from typing import Optional
+
+# Where the real NetcoreCIAgent /ci endpoint lives (same default as orch_service).
+CI_AGENT_URL = os.getenv("CI_AGENT_URL", "http://127.0.0.1:8001")
 
 
 class RunCIAgent(Tool):
@@ -51,49 +55,54 @@ class RunCIAgent(Tool):
 
     def run(self, repo_url: str, branch: str = "main", include_dast: bool = True,
             open_pr: bool = True, allow_llm_fallback: bool = False) -> dict:
-        """Run the CI agent."""
-        return {
-            "status": "ci_agent_initiated",
+        """Invoke the real NetcoreCIAgent /ci endpoint and return its result.
+
+        The GitHub token is read from the environment (``GITHUB_TOKEN`` /
+        ``GH_TOKEN``) rather than the model prompt, so no secret flows through the
+        LLM. For interactive runs with a per-user token, prefer the orchestrator
+        console's Run CI button (POST /ci), which forwards the token directly.
+        """
+        import requests
+
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or ""
+        target = CI_AGENT_URL.rstrip("/") + "/ci"
+        payload = {
             "repo_url": repo_url,
-            "branch": branch,
-            "agent": "NetcoreCIAgent",
-            "action": "Generate GitHub Actions CI Pipeline",
-            "workflow": {
-                "step_1": "Discover project structure and framework",
-                "step_2": "Generate GitHub Actions workflow",
-                "step_3": "Validate workflow syntax and structure",
-                "step_4": "Open pull request for human review"
-            },
-            "pipeline_stages": [
-                "Build (.NET CLI/MSBuild/NuGet)",
-                "Unit Tests",
-                "SonarQube Code Coverage",
-                "SAST (Fortify)",
-                "SCA (Sonatype)",
-                "DAST (Fortify WebInspect)" if include_dast else "DAST (disabled)",
-                "Docker Image Build & Scan (Wiz)",
-                "SBOM Generation",
-                "Nexus Artifact Storage",
-                "Helm Chart Update",
-                "Dynatrace & Splunk Monitoring"
-            ],
+            "github_token": token,
             "options": {
-                "dast_enabled": include_dast,
-                "docker_enabled": True,
-                "helm_enabled": True,
+                "branch": branch,
+                "include_dast": include_dast,
                 "open_pr": open_pr,
                 "allow_llm_fallback": allow_llm_fallback,
-                "monitoring": ["dynatrace", "splunk"]
             },
-            "next_steps": [
-                "Agent will analyze the repository",
-                "GitHub Actions workflow will be generated",
-                ("PR will be opened for your review" if open_pr
-                 else "Workflow generated only — no PR opened (open_pr=false)"),
-                "Merge the PR when ready to activate the pipeline"
-            ],
-            "placeholder_notice": "This is a placeholder response. In production, this would invoke the actual NetcoreCIAgent service with the provided repository URL."
+            "selected_tools": {},
         }
+        try:
+            resp = requests.post(target, json=payload, timeout=180)
+        except requests.RequestException as exc:
+            return {
+                "status": "error",
+                "agent": "NetcoreCIAgent",
+                "error": (
+                    f"Could not reach the CI agent at {target} ({type(exc).__name__}). "
+                    "Is ci-serve running and CI_AGENT_URL correct?"
+                ),
+            }
+        try:
+            data = resp.json()
+        except ValueError:
+            return {"status": "error", "agent": "NetcoreCIAgent",
+                    "http_status": resp.status_code, "error": resp.text[:500]}
+        if isinstance(data, dict):
+            data.setdefault("agent", "NetcoreCIAgent")
+            if not token and data.get("status") == "error":
+                data.setdefault(
+                    "hint",
+                    "No GITHUB_TOKEN in the environment; use the console's Run CI "
+                    "button to supply a token, or export GITHUB_TOKEN for the orchestrator.",
+                )
+            return data
+        return {"status": "ok", "agent": "NetcoreCIAgent", "result": data}
 
 
 class RunCDAgent(Tool):

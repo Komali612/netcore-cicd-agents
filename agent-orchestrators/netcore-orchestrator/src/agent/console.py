@@ -72,10 +72,14 @@ CONSOLE_HTML = """<!doctype html>
   <h1>.NET Core CI/CD Orchestrator</h1>
   <div class="sub">Provide a Git repository URL, pick your tools, then choose which agent to run.</div>
 
-  <label class="fld" for="repo">Git repository URL</label>
-  <input id="repo" type="text" placeholder="https://github.com/your-org/your-repo.git">
+  <div class="grid">
+    <div><label class="fld" for="repo">Git repository URL</label>
+      <input id="repo" type="text" placeholder="https://github.com/your-org/your-repo.git"></div>
+    <div><label class="fld" for="ghToken">GitHub token (opens the PR)</label>
+      <input id="ghToken" type="password" placeholder="ghp_… — classic PAT with repo + workflow"></div>
+  </div>
 
-  <div class="caphint">Config &amp; credentials are collapsed by default — expand a section, pick a tool, and its fields appear.</div>
+  <div class="caphint">Run CI sends your inputs straight to the NetcoreCIAgent (no LLM) and returns a real pull request. Config &amp; credentials are collapsed by default — expand a section, pick a tool, and its fields appear.</div>
 
   <details class="sec">
     <summary><span class="chev">&#9654;</span> CI — tools &amp; credentials <span class="tag">pick a tool per capability</span></summary>
@@ -134,7 +138,8 @@ CONSOLE_HTML = """<!doctype html>
 
   <pre id="out">Response will appear here.</pre>
   <div class="links">
-    POST <code>/run</code> &nbsp;·&nbsp; <a href="/docs">/docs</a> &nbsp;·&nbsp; <a href="/healthz">/healthz</a>
+    Run CI → POST <code>/ci</code> (forwarded to the NetcoreCIAgent) &nbsp;·&nbsp;
+    <a href="/docs">/docs</a> &nbsp;·&nbsp; <a href="/healthz">/healthz</a>
   </div>
 
   <script>
@@ -245,6 +250,24 @@ CONSOLE_HTML = """<!doctype html>
       return out;
     }
 
+    // Direct channel to the CI agent (no LLM): send the REAL field values,
+    // including secrets, so the agent can set them and open the PR.
+    function collectReal(cats){
+      const out = {};
+      cats.forEach(cat => {
+        const t = ($('sel__' + cat.key) || {}).value;
+        if (!t) return;
+        const vals = { tool: t };
+        (cat.tools[t] || []).forEach(fd => {
+          const el = $('fld__' + cat.key + '__' + fd.id);
+          const v = el ? el.value.trim() : '';
+          if (v) vals[fd.label] = v;
+        });
+        out[cat.label] = vals;
+      });
+      return out;
+    }
+
     function options(){
       return {
         open_pr: $('optPr').checked, allow_llm_fallback: $('optLlm').checked,
@@ -257,34 +280,34 @@ CONSOLE_HTML = """<!doctype html>
     async function run(kind){
       const url = $('repo').value.trim();
       if (!url) { $('out').textContent = 'Enter a Git repository URL first.'; return; }
-      let spec;
+      const token = $('ghToken').value.trim();
+      let endpoint, spec;
       if (kind === 'ci') {
-        spec = { agent:'NetcoreCIAgent', repo_url:url, options:options(),
-                 selected_tools:collect(CI_CATS), monitoring:collect(MON_CATS) };
+        if (!token) { $('out').textContent = 'Enter a GitHub token — it is used to open the pull request.'; return; }
+        endpoint = '/ci';
+        // Fold monitoring picks into selected_tools; send REAL values (direct channel).
+        const tools = Object.assign({}, collectReal(CI_CATS), collectReal(MON_CATS));
+        spec = { repo_url:url, github_token:token, options:options(), selected_tools:tools };
       } else {
-        spec = { agent:'NetcoreCDAgent', repo_url:url, options:options(),
-                 platform:collect([CD_PLATFORM]),
-                 deployment:{ kubernetes_cluster:$('cluster').value.trim(), namespace:$('ns').value.trim(),
-                   app_name:$('app').value.trim(), container_name:$('container').value.trim(),
-                   playwright_repo:$('pw').value.trim(), dast_severity_threshold:$('dastSev').value,
-                   kube_token: $('kube').value.trim() ? '[provided via UI]' : '' },
-                 approvals:{ approver_name:$('apprName').value.trim(), approver_email:$('apprEmail').value.trim(),
-                   change_system:$('cm').value.trim(), change_request:$('cr').value.trim(),
-                   notify:$('notify').value.split(',').map(s=>s.trim()).filter(Boolean) },
-                 monitoring:collect(MON_CATS) };
+        endpoint = '/cd';
+        spec = { repo_url:url, github_token:token, options:options(),
+                 selected_tools:collectReal([CD_PLATFORM]) };
       }
-      const verb = kind === 'ci' ? 'Generate a CI pipeline' : 'Generate a CD pipeline';
-      const input = verb + ' for ' + url + '. Configuration selected in the UI ' +
-        '(secret values shown as [provided via UI], not included):\\n' + JSON.stringify(spec, null, 2);
 
-      $('out').textContent = 'Running ' + kind.toUpperCase() + ' agent...';
+      $('out').textContent = 'Running ' + kind.toUpperCase() + ' agent (via orchestrator → CI agent)...';
       $('runCi').disabled = $('runCd').disabled = true;
       try {
-        const r = await fetch('/run', { method:'POST', headers:{'content-type':'application/json'},
-          body: JSON.stringify({ input }) });
-        const t = await r.text();
-        let pretty; try { pretty = JSON.stringify(JSON.parse(t), null, 2); } catch { pretty = t; }
-        $('out').textContent = (r.ok ? '' : 'HTTP ' + r.status + '\\n') + pretty;
+        const r = await fetch(endpoint, { method:'POST', headers:{'content-type':'application/json'},
+          body: JSON.stringify(spec) });
+        let d = null; const t = await r.text();
+        try { d = JSON.parse(t); } catch { /* non-JSON */ }
+        if (d && d.pr && d.pr.pr_url) {
+          $('out').innerHTML = '\\u2705 <b>PR opened:</b> <a href="' + d.pr.pr_url +
+            '" target="_blank" rel="noopener">' + d.pr.pr_url + '</a>\\n\\n' + JSON.stringify(d, null, 2);
+        } else {
+          const pretty = d ? JSON.stringify(d, null, 2) : t;
+          $('out').textContent = (r.ok ? '' : 'HTTP ' + r.status + '\\n') + pretty;
+        }
       } catch (e) { $('out').textContent = 'Error: ' + e; }
       finally { $('runCi').disabled = $('runCd').disabled = false; }
     }
