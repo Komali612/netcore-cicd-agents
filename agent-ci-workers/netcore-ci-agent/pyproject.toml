@@ -14,11 +14,15 @@ dependencies = [
     "pyyaml>=6.0",
     "pygithub>=2.0",
     "pynacl>=1.5",       # PyGithub uses this to encrypt Actions secret values
+    "sqlalchemy>=2.0",   # dialect-agnostic ORM (MySQL now, Postgres later)
+    "pymysql>=1.1",      # pure-Python MySQL driver (mysql+pymysql://...)
+    "cryptography>=42",  # Fernet encryption for secret columns at rest
 ]
 
 [project.scripts]
 agent = "agent.main:main"
 ci-serve = "agent.ci_service:main"   # direct credentialed CI console + POST /ci
+db-init = "agent.db.db_init:main"    # create the database schema (dev/bootstrap)
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent"]
