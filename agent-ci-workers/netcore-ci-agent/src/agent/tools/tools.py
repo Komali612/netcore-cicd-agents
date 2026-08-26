@@ -173,6 +173,38 @@ class GenerateGitHubActionsWorkflow(Tool):
             enable_docker_build: bool = True, enable_helm_update: bool = True) -> dict:
         """Generate GitHub Actions workflow YAML."""
         try:
+            # Container job — pushes to GHCR using the workflow's built-in
+            # GITHUB_TOKEN (no separate registry PAT needed). Built as a plain
+            # string so GitHub's ${{ ... }} expressions need no f-string escaping.
+            if enable_docker_build:
+                container_job = (
+                    "  container:\n"
+                    "    needs: security\n"
+                    "    runs-on: __RUNNER__\n"
+                    "    permissions:\n"
+                    "      contents: read\n"
+                    "      packages: write\n"
+                    "    steps:\n"
+                    "      - name: Checkout code\n"
+                    "        uses: actions/checkout@v4\n"
+                    "      - name: Log in to GHCR\n"
+                    "        uses: docker/login-action@v3\n"
+                    "        with:\n"
+                    "          registry: ghcr.io\n"
+                    "          username: ${{ github.actor }}\n"
+                    "          password: ${{ secrets.GITHUB_TOKEN }}\n"
+                    "      - name: Build and push image\n"
+                    "        run: |\n"
+                    "          REPO=$(echo \"${{ github.repository }}\" | tr '[:upper:]' '[:lower:]')\n"
+                    "          IMAGE=ghcr.io/$REPO:${{ github.sha }}\n"
+                    "          docker build -t \"$IMAGE\" .\n"
+                    "          docker push \"$IMAGE\"\n"
+                    "      - name: Generate SBOM\n"
+                    "        run: echo 'SBOM generation (placeholder — e.g. Trivy/Syft)'\n"
+                ).replace("__RUNNER__", runner_os)
+            else:
+                container_job = "  # container build disabled in configuration\n"
+
             workflow_yaml = f"""name: '{project_name} CI Pipeline'
 
 on:
@@ -209,11 +241,17 @@ jobs:
         with:
           dotnet-version: '{self._get_dotnet_version(target_framework)}'
 
-      - name: Restore dependencies
-        run: dotnet restore
-
-      - name: Build
-        run: dotnet build --configuration Release --no-restore
+      - name: Restore & build
+        run: |
+          SLN=$(find . -name '*.sln' -print -quit)
+          if [ -n "$SLN" ]; then
+            dotnet build "$SLN" --configuration Release
+          else
+            for p in $(find . -name '*.csproj'); do
+              echo "Building $p"
+              dotnet build "$p" --configuration Release
+            done
+          fi
 
   test:
     needs: build
@@ -227,11 +265,14 @@ jobs:
         with:
           dotnet-version: '{self._get_dotnet_version(target_framework)}'
 
-      - name: Restore dependencies
-        run: dotnet restore
-
       - name: Run Unit Tests
-        run: dotnet test --configuration Release --no-build --verbosity normal
+        run: |
+          TESTS=$(find . -name '*.csproj' | grep -i test || true)
+          if [ -z "$TESTS" ]; then echo "No test projects found"; exit 0; fi
+          for p in $TESTS; do
+            echo "Testing $p"
+            dotnet test "$p" --configuration Release
+          done
 
   sonarqube:
     needs: test
@@ -270,17 +311,7 @@ jobs:
 {"      - name: Run DAST (Fortify WebInspect)" if include_dast else "      # - name: Run DAST (Fortify WebInspect)"}
 {"        run: echo 'DAST analysis via Fortify WebInspect (placeholder)'" if include_dast else "        # run: echo 'DAST analysis via Fortify WebInspect (placeholder)'"}
 
-{"  container:" if enable_docker_build else "  # container build disabled in configuration"}
-{"    needs: security" if enable_docker_build else "    # needs: security"}
-{"    runs-on: " + runner_os if enable_docker_build else "    # runs-on: " + runner_os}
-{"    steps:" if enable_docker_build else "    # steps:"}
-{"      - name: Build Docker Image" if enable_docker_build else "      # - name: Build Docker Image"}
-{"        run: echo 'Docker build and scan (placeholder)'" if enable_docker_build else "        # run: echo 'Docker build and scan (placeholder)'"}
-{"      - name: Generate SBOM" if enable_docker_build else "      # - name: Generate SBOM"}
-{"        run: echo 'SBOM generation (placeholder)'" if enable_docker_build else "        # run: echo 'SBOM generation (placeholder)'"}
-{"      - name: Push to Nexus" if enable_docker_build else "      # - name: Push to Nexus"}
-{"        run: echo 'Push artifact to Nexus (placeholder)'" if enable_docker_build else "        # run: echo 'Push artifact to Nexus (placeholder)'"}
-
+{container_job}
 {"  helm:" if enable_helm_update else "  # helm update disabled in configuration"}
 {"    needs: container" if enable_helm_update else "    # needs: container"}
 {"    runs-on: " + runner_os if enable_helm_update else "    # runs-on: " + runner_os}
